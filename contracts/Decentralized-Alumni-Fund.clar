@@ -15,6 +15,9 @@
 (define-data-var total-fund-balance uint u0)
 (define-data-var min-contribution uint u100)
 (define-data-var repayment-period uint u52560)
+(define-data-var interest-rate uint u200)
+(define-data-var last-interest-block uint u0)
+(define-data-var compound-frequency uint u2016)
 
 (define-map alumni
   { alumni-address: principal }
@@ -102,6 +105,30 @@
 
 (define-read-only (get-repayment-info (student principal) (request-id uint))
   (map-get? repayment-schedule { student: student, request-id: request-id })
+)
+
+(define-read-only (get-interest-rate)
+  (var-get interest-rate)
+)
+
+(define-read-only (get-compound-frequency)
+  (var-get compound-frequency)
+)
+
+(define-read-only (calculate-accrued-interest)
+  (let ((current-balance (var-get total-fund-balance))
+        (last-block (var-get last-interest-block))
+        (current-block stacks-block-height)
+        (compound-freq (var-get compound-frequency))
+        (rate (var-get interest-rate)))
+    (if (and (> current-balance u0) (>= (- current-block last-block) compound-freq))
+      (let ((periods (/ (- current-block last-block) compound-freq))
+            (interest-per-period (/ (* current-balance rate) u10000)))
+        (* periods interest-per-period)
+      )
+      u0
+    )
+  )
 )
 
 (define-public (register-alumni)
@@ -316,6 +343,39 @@
       error (err error)
     )
     ERR_INVALID_AMOUNT
+  )
+)
+
+(define-public (compound-interest)
+  (let ((accrued-interest (calculate-accrued-interest)))
+    (if (> accrued-interest u0)
+      (begin
+        (var-set total-fund-balance (+ (var-get total-fund-balance) accrued-interest))
+        (var-set last-interest-block stacks-block-height)
+        (ok accrued-interest)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (update-interest-rate (new-rate uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (begin
+      (var-set interest-rate new-rate)
+      (ok true)
+    )
+    ERR_NOT_AUTHORIZED
+  )
+)
+
+(define-public (update-compound-frequency (new-frequency uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (begin
+      (var-set compound-frequency new-frequency)
+      (ok true)
+    )
+    ERR_NOT_AUTHORIZED
   )
 )
 
