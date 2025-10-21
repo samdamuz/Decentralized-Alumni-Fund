@@ -8,6 +8,11 @@
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_SELF_FUNDING (err u107))
 (define-constant ERR_REPAYMENT_NOT_DUE (err u108))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u109))
+(define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u110))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u111))
+(define-constant ERR_INVALID_MILESTONE (err u112))
+(define-constant ERR_MILESTONE_NOT_APPROVED (err u113))
 
 (define-fungible-token gratitude-token)
 
@@ -18,6 +23,7 @@
 (define-data-var interest-rate uint u200)
 (define-data-var last-interest-block uint u0)
 (define-data-var compound-frequency uint u2016)
+(define-data-var next-milestone-id uint u1)
 
 (define-map alumni
   { alumni-address: principal }
@@ -73,6 +79,32 @@
     due-block: uint,
     status: (string-ascii 10)
   }
+)
+
+(define-map funding-milestones
+  { milestone-id: uint }
+  {
+    request-id: uint,
+    milestone-number: uint,
+    description: (string-ascii 200),
+    amount: uint,
+    deadline-block: uint,
+    status: (string-ascii 15),
+    approvals: uint,
+    rejections: uint,
+    disbursed: bool,
+    created-block: uint
+  }
+)
+
+(define-map milestone-votes
+  { milestone-id: uint, voter: principal }
+  { vote: (string-ascii 10), block-height: uint }
+)
+
+(define-map request-milestones
+  { request-id: uint }
+  { milestone-ids: (list 10 uint), total-milestones: uint }
 )
 
 (define-read-only (get-alumni-info (alumni-address principal))
@@ -393,5 +425,258 @@
   (if (is-eq tx-sender CONTRACT_OWNER)
     (ok true)
     ERR_NOT_AUTHORIZED
+  )
+)
+
+(define-public (create-milestone
+  (request-id uint)
+  (milestone-number uint)
+  (description (string-ascii 200))
+  (amount uint)
+  (deadline-blocks uint))
+  (let ((student tx-sender)
+        (milestone-id (var-get next-milestone-id)))
+    (match (get-funding-request request-id)
+      request-info (if (and (is-eq (get student request-info) student)
+                           (is-eq (get status request-info) "pending")
+                           (> amount u0)
+                           (> deadline-blocks u0))
+        (begin
+          (map-set funding-milestones
+            { milestone-id: milestone-id }
+            {
+              request-id: request-id,
+              milestone-number: milestone-number,
+              description: description,
+              amount: amount,
+              deadline-block: (+ stacks-block-height deadline-blocks),
+              status: "pending",
+              approvals: u0,
+              rejections: u0,
+              disbursed: false,
+              created-block: stacks-block-height
+            }
+          )
+          (let ((current-milestones (default-to 
+                                      { milestone-ids: (list), total-milestones: u0 }
+                                      (map-get? request-milestones { request-id: request-id })))
+                (updated-list (unwrap! (as-max-len? 
+                                         (append (get milestone-ids current-milestones) milestone-id) 
+                                         u10) 
+                                       ERR_INVALID_MILESTONE)))
+            (map-set request-milestones
+              { request-id: request-id }
+              {
+                milestone-ids: updated-list,
+                total-milestones: (+ (get total-milestones current-milestones) u1)
+              }
+            )
+          )
+          (var-set next-milestone-id (+ milestone-id u1))
+          (ok milestone-id)
+        )
+        ERR_INVALID_MILESTONE
+      )
+      ERR_REQUEST_NOT_FOUND
+    )
+  )
+)
+
+(define-public (vote-on-milestone (milestone-id uint) (vote-type (string-ascii 10)))
+  (let ((voter tx-sender))
+    (if (is-some (get-alumni-info voter))
+      (match (get-milestone milestone-id)
+        milestone-info (if (is-eq (get status milestone-info) "pending")
+          (begin
+            (map-set milestone-votes
+              { milestone-id: milestone-id, voter: voter }
+              { vote: vote-type, block-height: stacks-block-height }
+            )
+            (let ((updated-approvals (if (is-eq vote-type "approve")
+                                       (+ (get approvals milestone-info) u1)
+                                       (get approvals milestone-info)))
+                  (updated-rejections (if (is-eq vote-type "reject")
+                                        (+ (get rejections milestone-info) u1)
+                                        (get rejections milestone-info))))
+              (map-set funding-milestones
+                { milestone-id: milestone-id }
+                (merge milestone-info {
+                  approvals: updated-approvals,
+                  rejections: updated-rejections
+                })
+              )
+              (ok true)
+            )
+          )
+          ERR_MILESTONE_ALREADY_COMPLETED
+        )
+        ERR_MILESTONE_NOT_FOUND
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-public (disburse-milestone (milestone-id uint))
+  (match (get-milestone milestone-id)
+    milestone-info (if (and (>= (get approvals milestone-info) u2)
+                           (is-eq (get status milestone-info) "pending")
+                           (not (get disbursed milestone-info)))
+      (match (get-funding-request (get request-id milestone-info))
+        request-info (if (and (is-eq (get status request-info) "funded")
+                             (>= (var-get total-fund-balance) (get amount milestone-info)))
+          (begin
+            (try! (as-contract (stx-transfer? 
+                                 (get amount milestone-info) 
+                                 tx-sender 
+                                 (get student request-info))))
+            (var-set total-fund-balance (- (var-get total-fund-balance) (get amount milestone-info)))
+            (map-set funding-milestones
+              { milestone-id: milestone-id }
+              (merge milestone-info {
+                status: "completed",
+                disbursed: true
+              })
+            )
+            (ok true)
+          )
+          ERR_INSUFFICIENT_FUNDS
+        )
+        ERR_REQUEST_NOT_FOUND
+      )
+      ERR_INSUFFICIENT_APPROVALS
+    )
+    ERR_MILESTONE_NOT_FOUND
+  )
+)
+
+(define-public (mark-milestone-complete (milestone-id uint))
+  (let ((student tx-sender))
+    (match (get-milestone milestone-id)
+      milestone-info (match (get-funding-request (get request-id milestone-info))
+        request-info (if (and (is-eq (get student request-info) student)
+                             (get disbursed milestone-info)
+                             (not (is-eq (get status milestone-info) "verified")))
+          (begin
+            (map-set funding-milestones
+              { milestone-id: milestone-id }
+              (merge milestone-info { status: "submitted" })
+            )
+            (ok true)
+          )
+          ERR_MILESTONE_NOT_APPROVED
+        )
+        ERR_REQUEST_NOT_FOUND
+      )
+      ERR_MILESTONE_NOT_FOUND
+    )
+  )
+)
+
+(define-public (verify-milestone-completion (milestone-id uint))
+  (let ((voter tx-sender))
+    (if (is-some (get-alumni-info voter))
+      (match (get-milestone milestone-id)
+        milestone-info (if (is-eq (get status milestone-info) "submitted")
+          (begin
+            (map-set funding-milestones
+              { milestone-id: milestone-id }
+              (merge milestone-info { status: "verified" })
+            )
+            (ok true)
+          )
+          ERR_MILESTONE_ALREADY_COMPLETED
+        )
+        ERR_MILESTONE_NOT_FOUND
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? funding-milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-request-milestones (request-id uint))
+  (map-get? request-milestones { request-id: request-id })
+)
+
+(define-read-only (get-milestone-vote (milestone-id uint) (voter principal))
+  (map-get? milestone-votes { milestone-id: milestone-id, voter: voter })
+)
+
+(define-read-only (calculate-milestone-progress (request-id uint))
+  (match (get-request-milestones request-id)
+    milestones-data
+    (let ((total (get total-milestones milestones-data))
+          (milestone-ids (get milestone-ids milestones-data)))
+      (ok {
+        total-milestones: total,
+        completed-milestones: (count-completed-milestones milestone-ids),
+        disbursed-milestones: (count-disbursed-milestones milestone-ids),
+        pending-milestones: (count-pending-milestones milestone-ids)
+      })
+    )
+    (ok {
+      total-milestones: u0,
+      completed-milestones: u0,
+      disbursed-milestones: u0,
+      pending-milestones: u0
+    })
+  )
+)
+
+(define-private (count-completed-milestones (milestone-ids (list 10 uint)))
+  (fold check-milestone-completed milestone-ids u0)
+)
+
+(define-private (check-milestone-completed (milestone-id uint) (count uint))
+  (match (get-milestone milestone-id)
+    milestone-info (if (is-eq (get status milestone-info) "verified")
+                     (+ count u1)
+                     count)
+    count
+  )
+)
+
+(define-private (count-disbursed-milestones (milestone-ids (list 10 uint)))
+  (fold check-milestone-disbursed milestone-ids u0)
+)
+
+(define-private (check-milestone-disbursed (milestone-id uint) (count uint))
+  (match (get-milestone milestone-id)
+    milestone-info (if (get disbursed milestone-info)
+                     (+ count u1)
+                     count)
+    count
+  )
+)
+
+(define-private (count-pending-milestones (milestone-ids (list 10 uint)))
+  (fold check-milestone-pending milestone-ids u0)
+)
+
+(define-private (check-milestone-pending (milestone-id uint) (count uint))
+  (match (get-milestone milestone-id)
+    milestone-info (if (is-eq (get status milestone-info) "pending")
+                     (+ count u1)
+                     count)
+    count
+  )
+)
+
+(define-read-only (get-milestone-details (milestone-id uint))
+  (match (get-milestone milestone-id)
+    milestone-info
+    (ok {
+      milestone: milestone-info,
+      approval-rate: (if (> (+ (get approvals milestone-info) (get rejections milestone-info)) u0)
+                       (/ (* (get approvals milestone-info) u100) 
+                          (+ (get approvals milestone-info) (get rejections milestone-info)))
+                       u0),
+      is-overdue: (> stacks-block-height (get deadline-block milestone-info))
+    })
+    ERR_MILESTONE_NOT_FOUND
   )
 )
